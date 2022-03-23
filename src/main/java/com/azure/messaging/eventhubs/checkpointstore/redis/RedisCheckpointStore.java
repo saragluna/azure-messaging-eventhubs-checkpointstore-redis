@@ -3,6 +3,7 @@
 
 package com.azure.messaging.eventhubs.checkpointstore.redis;
 
+import com.azure.core.util.CoreUtils;
 import com.azure.core.util.logging.ClientLogger;
 import com.azure.messaging.eventhubs.CheckpointStore;
 import com.azure.messaging.eventhubs.models.Checkpoint;
@@ -68,18 +69,28 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
     @Override
     public Flux<PartitionOwnership> claimOwnership(List<PartitionOwnership> requestedPartitionOwnerships) {
 
-        //        return Flux.fromIterable(requestedPartitionOwnerships).flatMap(partitionOwnership -> {
-        //            try {
-        //                String partitionId = partitionOwnership.getPartitionId();
-        //                String blobName = getBlobName(partitionOwnership.getFullyQualifiedNamespace(),
-        //                    partitionOwnership.getEventHubName(), partitionOwnership.getConsumerGroup(), partitionId,
-        //                    OWNERSHIP_PATH);
-        //
-        //                if (!blobClients.containsKey(blobName)) {
-        //                    blobClients.put(blobName, blobContainerAsyncClient.getBlobAsyncClient(blobName));
-        //                }
-        //            }
-        //        });
+        return Flux.fromIterable(requestedPartitionOwnerships).flatMap(partitionOwnership -> {
+            try {
+
+                String fullyQualifiedNamespace = partitionOwnership.getFullyQualifiedNamespace();
+                String eventHubName = partitionOwnership.getEventHubName();
+                String consumerGroup = partitionOwnership.getConsumerGroup();
+                String ownershipKey = String.format(OWNERSHIP_KEY, fullyQualifiedNamespace,
+                    eventHubName, consumerGroup);
+
+                String partitionId = partitionOwnership.getPartitionId();
+                if (CoreUtils.isNullOrEmpty(partitionOwnership.getETag())) {
+
+                } else {
+
+                }
+            } catch (Exception ex) {
+                logger.atWarning()
+                      .addKeyValue(PARTITION_ID_LOG_KEY, partitionOwnership.getPartitionId())
+                      .log(Messages.CLAIM_ERROR, ex);
+                return Mono.empty();
+            }
+        });
 
 
         return null;
@@ -111,6 +122,8 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                        });
     }
 
+    // "{fully qualified namespace}/{eventhub name}/{consumer group}/checkpoints"
+    private static final String OWNERSHIP_KEY = "%s/%s/%s/ownerships";
     // "{fully qualified namespace}/{eventhub name}/{consumer group}/checkpoints"
     private static final String CHECKPOINTS_KEY = "%s/%s/%s/checkpoints";
     // "{fully qualified namespace}/{eventhub name}/{consumer group}/checkpoints/{partition id}"
