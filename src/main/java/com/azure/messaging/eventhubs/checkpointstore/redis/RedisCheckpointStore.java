@@ -80,24 +80,6 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                                        eventHubName, consumerGroup, partitionId, ownerIdAndEtag)));
     }
 
-    private PartitionOwnership convertToPartitionOwnership(String fullyQualifiedNamespace, String eventHubName,
-                                                     String consumerGroup, String partitionId, String ownerIdAndEtag) {
-        String[] metadata = ownerIdAndEtag.split("_");
-        String etag = metadata[1];
-        PartitionOwnership partitionOwnership =
-            new PartitionOwnership();
-
-        partitionOwnership.setOwnerId(metadata[0]);
-        partitionOwnership.setETag(etag);
-        partitionOwnership.setPartitionId(partitionId);
-        partitionOwnership.setConsumerGroup(consumerGroup);
-        partitionOwnership.setEventHubName(eventHubName);
-        partitionOwnership.setFullyQualifiedNamespace(fullyQualifiedNamespace);
-        partitionOwnership.setLastModifiedTime(Long.parseLong(etag));
-
-        return partitionOwnership;
-    }
-
     @Override
     public Flux<PartitionOwnership> claimOwnership(List<PartitionOwnership> requestedPartitionOwnerships) {
 
@@ -113,7 +95,7 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                 if (CoreUtils.isNullOrEmpty(partitionOwnership.getETag())) {
                     String eTag = String.valueOf(System.currentTimeMillis());
                     return commands
-                        .setnx(ownershipKey, partitionOwnership.getOwnerId() + "_" + eTag)
+                        .setnx(ownershipKey, partitionOwnership.getOwnerId() + "/" + eTag)
                         .flatMapMany(
                             result -> {
                                 if (Boolean.TRUE.equals(result)) {
@@ -145,7 +127,6 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                                       .addKeyValue(PARTITION_ID_LOG_KEY, partitionId)
                                       .log(Messages.CLAIM_ERROR, error);
                                 return Mono.empty();
-
                             },
                             Mono::empty
                         );
@@ -159,20 +140,38 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
         });
     }
 
+    private PartitionOwnership convertToPartitionOwnership(String fullyQualifiedNamespace, String eventHubName,
+                                                           String consumerGroup, String partitionId, String ownerIdAndEtag) {
+        String[] metadata = ownerIdAndEtag.split("_");
+        String etag = metadata[1];
+        PartitionOwnership partitionOwnership =
+            new PartitionOwnership();
+
+        partitionOwnership.setOwnerId(metadata[0]);
+        partitionOwnership.setETag(etag);
+        partitionOwnership.setPartitionId(partitionId);
+        partitionOwnership.setConsumerGroup(consumerGroup);
+        partitionOwnership.setEventHubName(eventHubName);
+        partitionOwnership.setFullyQualifiedNamespace(fullyQualifiedNamespace);
+        partitionOwnership.setLastModifiedTime(Long.parseLong(etag));
+
+        return partitionOwnership;
+    }
+
     private void updateOwnerId(String ownershipKey, PartitionOwnership partitionOwnership) {
         String ownerIdAndEtag = syncCommands.get(ownershipKey);
-        if (ownerIdAndEtag.endsWith(partitionOwnership.getETag())) {
+        if (ownerIdAndEtag.endsWith("/" + partitionOwnership.getETag())) {
             syncCommands.multi();
             String eTag = String.valueOf(System.currentTimeMillis());
-            syncCommands.set(ownershipKey, partitionOwnership.getOwnerId() + "_" + eTag);
+            syncCommands.set(ownershipKey, partitionOwnership.getOwnerId() + "/" + eTag);
             TransactionResult result = syncCommands.exec();
-            if (!result.wasDiscarded()) {
+            if (result.wasDiscarded()) {
+                throw new IllegalStateException("Fail to claim the partition");
+            } else {
                 partitionOwnership.setETag(eTag);
                 logger.atInfo()
-                    .addKeyValue(PARTITION_ID_LOG_KEY, partitionOwnership.getPartitionId())
-                    .log("Claimed successfully!");
-            } else {
-                throw new IllegalStateException("Fail to claim the partition");
+                      .addKeyValue(PARTITION_ID_LOG_KEY, partitionOwnership.getPartitionId())
+                      .log("Claimed successfully!");
             }
         }
     }
