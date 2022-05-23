@@ -13,11 +13,10 @@ import io.lettuce.core.TransactionResult;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.reactive.RedisReactiveCommands;
 import io.lettuce.core.api.sync.RedisCommands;
+import java.util.List;
 import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-
-import java.util.List;
 
 public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
     private final ClientLogger logger = new ClientLogger(RedisCheckpointStore.class);
@@ -77,7 +76,9 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                        .flatMap(partitionId ->
                            commands.get(partitionId)
                                    .map(ownerIdAndEtag -> convertToPartitionOwnership(fullyQualifiedNamespace,
-                                       eventHubName, consumerGroup, partitionId, ownerIdAndEtag)));
+                                       eventHubName, consumerGroup, partitionId, ownerIdAndEtag))
+                               .filter(p -> p.getETag() != null)
+                       );
     }
 
     @Override
@@ -142,10 +143,14 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
 
     private PartitionOwnership convertToPartitionOwnership(String fullyQualifiedNamespace, String eventHubName,
                                                            String consumerGroup, String partitionId, String ownerIdAndEtag) {
-        String[] metadata = ownerIdAndEtag.split("_");
+
+        PartitionOwnership partitionOwnership = new PartitionOwnership();
+        String[] metadata = ownerIdAndEtag.split("/");
+        if (metadata.length < 2) {
+            return partitionOwnership;
+        }
         String etag = metadata[1];
-        PartitionOwnership partitionOwnership =
-            new PartitionOwnership();
+
 
         partitionOwnership.setOwnerId(metadata[0]);
         partitionOwnership.setETag(etag);
