@@ -12,22 +12,18 @@ import io.lettuce.core.RedisClient;
 import io.lettuce.core.TransactionResult;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.reactive.RedisReactiveCommands;
-import io.lettuce.core.api.sync.RedisCommands;
-import java.util.List;
 import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import java.util.List;
 
 public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
     private final ClientLogger logger = new ClientLogger(RedisCheckpointStore.class);
-    private static final String SEQUENCE_NUMBER = "sequencenumber";
-    private static final String OFFSET = "offset";
-    private static final String OWNER_ID = "ownerid";
-    private static final String ETAG = "eTag";
 
-    private static final String BLOB_PATH_SEPARATOR = "/";
-    private static final String CHECKPOINT_PATH = "/checkpoint/";
-    private static final String OWNERSHIP_PATH = "/ownership/";
+    private static final String OWNER_ID_ETAG_DELIMITER = "/";
+    private static final String CHECKPOINT_METADATA_DELIMITER = ":";
 
     // logging keys, consistent across all AMQP libraries and human-readable
     private static final String PARTITION_ID_LOG_KEY = "partitionId";
@@ -45,14 +41,12 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
 
     private final RedisClient redisClient;
     private final RedisReactiveCommands<String, String> commands;
-    private final RedisCommands<String, String> syncCommands;
     private final StatefulRedisConnection<String, String> connection;
 
     public RedisCheckpointStore(RedisClient redisClient) {
         this.redisClient = redisClient;
         this.connection = redisClient.connect();
         this.commands = connection.reactive();
-        this.syncCommands = connection.sync();
     }
 
     @Override
@@ -69,14 +63,17 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
     @Override
     public Flux<PartitionOwnership> listOwnership(String fullyQualifiedNamespace, String eventHubName,
                                                   String consumerGroup) {
-        String ownershipKey = String.format(OWNERSHIP_KEY, fullyQualifiedNamespace,
+        String ownershipKeyPattern = String.format(OWNERSHIP_KEY, fullyQualifiedNamespace,
             eventHubName, consumerGroup, "*");
 
-        return commands.keys(ownershipKey)
-                       .flatMap(partitionId ->
-                           commands.get(partitionId)
-                                   .map(ownerIdAndEtag -> convertToPartitionOwnership(fullyQualifiedNamespace,
-                                       eventHubName, consumerGroup, partitionId, ownerIdAndEtag))
+        return commands.keys(ownershipKeyPattern)
+                       .flatMap(ownershipKey ->
+                           commands.get(ownershipKey)
+                                   .map(ownerIdAndEtag -> {
+                                       String partitionId = ownershipKey.substring(ownershipKey.lastIndexOf("/") + 1);
+                                       return convertToPartitionOwnership(fullyQualifiedNamespace,
+                                           eventHubName, consumerGroup, partitionId, ownerIdAndEtag);
+                                   })
                                .filter(p -> p.getETag() != null)
                        );
     }
@@ -96,7 +93,7 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                 if (CoreUtils.isNullOrEmpty(partitionOwnership.getETag())) {
                     String eTag = String.valueOf(System.currentTimeMillis());
                     return commands
-                        .setnx(ownershipKey, partitionOwnership.getOwnerId() + "/" + eTag)
+                        .setnx(ownershipKey, partitionOwnership.getOwnerId() + OWNER_ID_ETAG_DELIMITER + eTag)
                         .flatMapMany(
                             result -> {
                                 if (Boolean.TRUE.equals(result)) {
@@ -115,14 +112,13 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                             Mono::empty
                         );
                 } else {
+                    // https://gitter.im/lettuce-io/Lobby?at=5b6f40b7a6af14730b20f5c4
                     return commands
                         .watch(ownershipKey)
-                        .doFinally(s -> commands.unwatch().block())
                         .flatMapMany(
-                            s -> {
-                                updateOwnerId(ownershipKey, partitionOwnership);
-                                return Mono.just(partitionOwnership);
-                            },
+                            s -> updateOwnerId(ownershipKey, partitionOwnership)
+                                .flatMap(tr -> tr.wasDiscarded() ? Mono.error(new IllegalArgumentException("")) : Mono.just(tr))
+                                .map(it -> partitionOwnership),
                             error -> {
                                 logger.atVerbose()
                                       .addKeyValue(PARTITION_ID_LOG_KEY, partitionId)
@@ -130,7 +126,9 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                                 return Mono.empty();
                             },
                             Mono::empty
-                        );
+                        )
+                        .publishOn(Schedulers.boundedElastic())
+                        .doFinally(s -> commands.unwatch().block());
                 }
             } catch (Exception ex) {
                 logger.atWarning()
@@ -145,12 +143,11 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                                                            String consumerGroup, String partitionId, String ownerIdAndEtag) {
 
         PartitionOwnership partitionOwnership = new PartitionOwnership();
-        String[] metadata = ownerIdAndEtag.split("/");
+        String[] metadata = ownerIdAndEtag.split(OWNER_ID_ETAG_DELIMITER);
         if (metadata.length < 2) {
             return partitionOwnership;
         }
         String etag = metadata[1];
-
 
         partitionOwnership.setOwnerId(metadata[0]);
         partitionOwnership.setETag(etag);
@@ -163,22 +160,13 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
         return partitionOwnership;
     }
 
-    private void updateOwnerId(String ownershipKey, PartitionOwnership partitionOwnership) {
-        String ownerIdAndEtag = syncCommands.get(ownershipKey);
-        if (ownerIdAndEtag.endsWith("/" + partitionOwnership.getETag())) {
-            syncCommands.multi();
-            String eTag = String.valueOf(System.currentTimeMillis());
-            syncCommands.set(ownershipKey, partitionOwnership.getOwnerId() + "/" + eTag);
-            TransactionResult result = syncCommands.exec();
-            if (result.wasDiscarded()) {
-                throw new IllegalStateException("Fail to claim the partition");
-            } else {
-                partitionOwnership.setETag(eTag);
-                logger.atInfo()
-                      .addKeyValue(PARTITION_ID_LOG_KEY, partitionOwnership.getPartitionId())
-                      .log("Claimed successfully!");
-            }
-        }
+    private Mono<TransactionResult> updateOwnerId(String ownershipKey, PartitionOwnership partitionOwnership) {
+        return this.commands.get(ownershipKey)
+                            .flatMap(current -> this.commands.multi().flatMap(multi -> {
+                                    String eTag = String.valueOf(System.currentTimeMillis());
+                                    this.commands.set(ownershipKey, partitionOwnership.getOwnerId() + OWNER_ID_ETAG_DELIMITER + eTag).subscribe();
+                                    return this.commands.exec();
+                                }));
     }
 
     @Override
@@ -192,7 +180,7 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                            String checkpointMetadata = kv.getValue();
                            Checkpoint checkpoint = new Checkpoint();
 
-                           String[] metadata = checkpointMetadata.split(":");
+                           String[] metadata = checkpointMetadata.split(CHECKPOINT_METADATA_DELIMITER);
                            String seqNumberValue = metadata[0];
                            String offsetValue = metadata[1];
                            Long sequenceNumber = seqNumberValue != null ? Long.valueOf(seqNumberValue) : null;
@@ -229,7 +217,7 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
         String sequenceNumber = checkpoint.getSequenceNumber() == null ? null :
             String.valueOf(checkpoint.getSequenceNumber());
         String offset = checkpoint.getOffset() == null ? null : String.valueOf(checkpoint.getOffset());
-        String checkpointMetadata = sequenceNumber + ":" + offset;
+        String checkpointMetadata = sequenceNumber + CHECKPOINT_METADATA_DELIMITER + offset;
 
         return commands.hset(checkpointSetKey, partitionId, checkpointMetadata).then();
     }
