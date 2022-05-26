@@ -81,7 +81,9 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
     @Override
     public Flux<PartitionOwnership> claimOwnership(List<PartitionOwnership> requestedPartitionOwnerships) {
 
-        return Flux.fromIterable(requestedPartitionOwnerships).flatMap(partitionOwnership -> {
+        return Flux.fromIterable(requestedPartitionOwnerships)
+                   .doOnNext(it -> logger.info("Claim ownership for next partition: " + it.getPartitionId() + " on: " + Thread.currentThread()))
+                   .concatMap(partitionOwnership -> {
             String partitionId = partitionOwnership.getPartitionId();
             try {
                 String fullyQualifiedNamespace = partitionOwnership.getFullyQualifiedNamespace();
@@ -94,45 +96,41 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
                     String eTag = String.valueOf(System.currentTimeMillis());
                     return commands
                         .setnx(ownershipKey, partitionOwnership.getOwnerId() + OWNER_ID_ETAG_DELIMITER + eTag)
-                        .flatMapMany(
-                            result -> {
-                                if (Boolean.TRUE.equals(result)) {
-                                    partitionOwnership.setETag(eTag);
-                                    return Mono.just(partitionOwnership);
-                                } else {
-                                    throw new IllegalStateException("Fail to claim the partition");
-                                }
-                            },
-                            error -> {
-                                logger.atVerbose()
-                                      .addKeyValue(PARTITION_ID_LOG_KEY, partitionId)
-                                      .log(Messages.CLAIM_ERROR, error);
-                                return Mono.empty();
-                            },
-                            Mono::empty
+                        .flatMap(result ->
+                            Boolean.TRUE.equals(result) ?
+                                Mono.just(partitionOwnership)
+                                    .map(it -> it.setETag(eTag))
+                                : Mono.error(new IllegalStateException("Fail to claim the partition")))
+                        .doOnError(error ->
+                            logger.atVerbose()
+                                  .addKeyValue("Thread", Thread.currentThread())
+                                  .addKeyValue(PARTITION_ID_LOG_KEY, partitionId)
+                                  .log(Messages.CLAIM_ERROR, error)
                         );
                 } else {
                     // https://gitter.im/lettuce-io/Lobby?at=5b6f40b7a6af14730b20f5c4
                     return commands
                         .watch(ownershipKey)
-                        .flatMapMany(
+                        .flatMap(
                             s -> updateOwnerId(ownershipKey, partitionOwnership)
-                                .flatMap(tr -> tr.wasDiscarded() ? Mono.error(new IllegalArgumentException("")) : Mono.just(tr))
-                                .map(it -> partitionOwnership),
-                            error -> {
-                                logger.atVerbose()
-                                      .addKeyValue(PARTITION_ID_LOG_KEY, partitionId)
-                                      .log(Messages.CLAIM_ERROR, error);
-                                return Mono.empty();
-                            },
-                            Mono::empty
+                                .flatMap(tr -> tr.wasDiscarded() ? Mono.error(new IllegalArgumentException("Fail to claim the partition")) : Mono.just(tr))
+                                .map(it -> partitionOwnership)
                         )
+                        .doOnError(error -> logger.atVerbose()
+                                                  .addKeyValue("Thread", Thread.currentThread())
+                                                  .addKeyValue(PARTITION_ID_LOG_KEY, partitionId)
+                                                  .log(Messages.CLAIM_ERROR, error))
+                        .doOnSubscribe(it -> logger.info("Subscribe the renew ownership key on : " + Thread.currentThread()))
                         .publishOn(Schedulers.boundedElastic())
-                        .doFinally(s -> commands.unwatch().block());
+                        .doFinally(s -> {
+                            logger.info("Subscribe the unwatch key on : " + Thread.currentThread());
+                            commands.unwatch().block();
+                        });
                 }
             } catch (Exception ex) {
                 logger.atWarning()
                       .addKeyValue(PARTITION_ID_LOG_KEY, partitionOwnership.getPartitionId())
+                      .addKeyValue("Thread", Thread.currentThread())
                       .log(Messages.CLAIM_ERROR, ex);
                 return Mono.empty();
             }
@@ -162,11 +160,19 @@ public class RedisCheckpointStore implements CheckpointStore, AutoCloseable {
 
     private Mono<TransactionResult> updateOwnerId(String ownershipKey, PartitionOwnership partitionOwnership) {
         return this.commands.get(ownershipKey)
-                            .flatMap(current -> this.commands.multi().flatMap(multi -> {
-                                    String eTag = String.valueOf(System.currentTimeMillis());
-                                    this.commands.set(ownershipKey, partitionOwnership.getOwnerId() + OWNER_ID_ETAG_DELIMITER + eTag).subscribe();
-                                    return this.commands.exec();
+                            .doOnNext(v -> logger.info("Subscribe the get ownership key on : " + Thread.currentThread()))
+                            .flatMap(current ->
+                                this.commands.multi()
+                                             .flatMap(multi -> {
+                                                 // Note: The calls to .subscribe() are an ugly workaround. Commands
+                                                 // issued during a transaction do not complete/do not receive any
+                                                 // response until exec() is called. So we need to issue the calls and
+                                                 // rely on that exec will catch any errors.
+                                                 String eTag = String.valueOf(System.currentTimeMillis());
+                                                 this.commands.set(ownershipKey, partitionOwnership.getOwnerId() + OWNER_ID_ETAG_DELIMITER + eTag).subscribe();
+                                                 return this.commands.exec().doOnNext(it -> logger.info("Subscribe the exec of transaction on : " + Thread.currentThread()));
                                 }));
+
     }
 
     @Override
